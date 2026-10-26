@@ -1,0 +1,3 @@
+# The Azure provider and the blob SDK are installed from the Dockerfile, not
+# here. A bare apache-airflow-providers-microsoft-azure pin also installs the
+# rest of the Azure product clients this reproduction never calls.

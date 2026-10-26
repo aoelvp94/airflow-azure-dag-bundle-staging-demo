@@ -1,0 +1,6 @@
+api-server:
+    port: "18081"
+postgres:
+    port: "15433"
+project:
+    name: airflow-azure-dag-bundle-staging-demo

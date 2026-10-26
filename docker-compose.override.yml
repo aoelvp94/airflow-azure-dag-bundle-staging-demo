@@ -1,0 +1,33 @@
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    container_name: wasb-bundle-azurite
+    command:
+      - azurite-blob
+      - --blobHost
+      - 0.0.0.0
+      - --blobPort
+      - "10000"
+      - --inMemoryPersistence
+      - --skipApiVersionCheck
+    ports:
+      - "11000:10000"
+    networks:
+      - airflow
+
+  wasb-proxy:
+    image: python:3.13-alpine
+    container_name: wasb-bundle-proxy
+    environment:
+      UPSTREAM_HOST: azurite
+      UPSTREAM_PORT: "10000"
+      LISTEN_PORT: "10000"
+    command: ["python", "/app/wasb_proxy.py"]
+    volumes:
+      - ./scripts/wasb_proxy.py:/app/wasb_proxy.py:ro
+    ports:
+      - "11088:10000"
+    depends_on:
+      - azurite
+    networks:
+      - airflow
