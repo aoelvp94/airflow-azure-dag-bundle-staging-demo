@@ -100,33 +100,31 @@ on localhost):
 Cold-staging benchmark, 3 rounds each (local dir wiped before every round)
 
 [1/2] stock WasbDagBundle — serial per-blob sync
-  round 1:   1.57s   (download=400, list=2, container=1)
-  round 2:   0.99s   (download=400, list=2, container=1)
-  round 3:   1.08s   (download=400, list=2, container=1)
+  round 1:   1.50s   (download=400, list=2, container=1)
+  round 2:   1.39s   (download=400, list=2, container=1)
+  round 3:   1.36s   (download=400, list=2, container=1)
 
 [2/2] WasbArchiveDagBundle — single tar.gz blob
-  round 1:   0.29s   (download=1, metadata=2, container=1)
-  round 2:   0.12s   (download=1, metadata=2, container=1)
-  round 3:   0.09s   (download=1, metadata=2, container=1)
+  round 1:   0.07s   (download=1, metadata=1, container=1)
+  round 2:   0.06s   (download=1, metadata=1, container=1)
+  round 3:   0.06s   (download=1, metadata=1, container=1)
+  warm refresh (ETag match, files present): download skipped (metadata=1)
 
 ==========================================================================
 scenario                                         median blob reqs   files
 --------------------------------------------------------------------------
-per-object sync (stock WasbDagBundle)             1.08s       403     400
-single archive (WasbArchiveDagBundle)             0.12s         4     400
+per-object sync (stock WasbDagBundle)             1.39s       403     400
+single archive (WasbArchiveDagBundle)             0.06s         3     400
 ==========================================================================
 
-speedup: 8.8x   (every KubernetesExecutor task pod pays the cold-staging cost)
+speedup: 21.3x   (every KubernetesExecutor task pod pays the cold-staging cost)
 ```
 
 The request mix did not move between rounds. Stock cold staging is 1
 container GET, 2 lists (the prefix check, then the refresh), and 400 blob
-downloads. That run's archive path probed blob properties twice (initialize,
-then refresh). This revision's cold archive path is 1 container GET, 1
-properties read, and 1 download pinned with `IfNotModified` (3 blob requests).
-A following warm refresh is the properties read only. The timings above are
-from that earlier loopback run; request count is the part that does not
-depend on the emulator.
+downloads. The cold archive path is 1 container GET, 1 properties read, and
+1 download pinned with `IfNotModified` (3 blob requests). A following warm
+refresh is the properties read only.
 
 Loopback Azurite makes each call a few milliseconds, so the wall-clock ratio
 is a floor. Request count is the part that does not depend on the emulator.
