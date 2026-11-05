@@ -3,11 +3,14 @@
 Benchmark cold DAG-bundle staging: stock per-blob sync vs single archive.
 
 Runs INSIDE an Airflow container (see `just bench`). Each round wipes the
-bundle's local directory first, simulating a fresh worker pod.
+bundle's local directory first, simulating a fresh worker pod. The archive
+ETag marker lives beside that directory, so the wipe leaves the marker in
+place. An empty directory is staged again instead of counting as unchanged.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import statistics
@@ -15,7 +18,12 @@ import sys
 import time
 import urllib.request
 
-from wasb_bundle import WasbArchiveDagBundle, WasbDagBundle
+from wasb_bundle import (
+    WASB_ARCHIVE_DAG_BUNDLE_CLASSPATH,
+    WASB_DAG_BUNDLE_CLASSPATH,
+    WasbArchiveDagBundle,
+    WasbDagBundle,
+)
 
 METRICS_URL = "http://wasb-proxy:10000/__metrics"
 CONTAINER = "dag-bundles"
@@ -39,6 +47,16 @@ def diff(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
     }
 
 
+def _wait_diff(before: dict[str, int]) -> dict[str, int]:
+    deltas: dict[str, int] = {}
+    for _ in range(15):
+        deltas = diff(before, request_counts())
+        if deltas.get("total"):
+            break
+        time.sleep(0.2)
+    return deltas
+
+
 def run_cold(make_bundle) -> tuple[float, dict[str, int], int]:
     bundle = make_bundle()
     shutil.rmtree(bundle.base_dir, ignore_errors=True)
@@ -46,12 +64,7 @@ def run_cold(make_bundle) -> tuple[float, dict[str, int], int]:
     t0 = time.perf_counter()
     bundle.initialize()
     elapsed = time.perf_counter() - t0
-    deltas: dict[str, int] = {}
-    for _ in range(15):
-        deltas = diff(before, request_counts())
-        if deltas.get("total"):
-            break
-        time.sleep(0.2)
+    deltas = _wait_diff(before)
     staged = sum(1 for path in bundle.path.rglob("*.py") if path.is_file())
     return elapsed, deltas, staged
 
@@ -68,8 +81,57 @@ def scenario(label: str, make_bundle) -> dict:
     return {"label": label, "median": statistics.median(timings), "reqs": last_reqs, "staged": staged}
 
 
+def assert_split() -> None:
+    stock_params = inspect.signature(WasbDagBundle.__init__).parameters
+    archive_params = inspect.signature(WasbArchiveDagBundle.__init__).parameters
+    if "archive_blob" in stock_params or "prefix" not in stock_params:
+        raise SystemExit(
+            f"{WASB_DAG_BUNDLE_CLASSPATH} must be the prefix bundle, not an archive_blob flag"
+        )
+    if "prefix" in archive_params or "archive_blob" not in archive_params:
+        raise SystemExit(
+            f"{WASB_ARCHIVE_DAG_BUNDLE_CLASSPATH} must take archive_blob and not prefix"
+        )
+    try:
+        WasbArchiveDagBundle(
+            name="reject-prefix",
+            container_name=CONTAINER,
+            prefix=PREFIX,
+            archive_blob=ARCHIVE_BLOB,
+            wasb_conn_id="wasb_default",
+        )
+    except TypeError:
+        pass
+    else:
+        raise SystemExit("WasbArchiveDagBundle accepted prefix")
+
+
+def assert_archive_marker(bundle) -> None:
+    marker = bundle.path.parent / f".{bundle.name}" / "etag"
+    if not marker.is_file() or not marker.read_text():
+        raise SystemExit(f"expected ETag marker beside the bundle directory at {marker}")
+    if (bundle.path / ".staged-archive-etag").exists():
+        raise SystemExit("ETag marker must not live inside the bundle directory")
+
+
+def assert_warm_skips_download(make_bundle) -> None:
+    bundle = make_bundle()
+    before = request_counts()
+    bundle.refresh()
+    deltas = _wait_diff(before)
+    pretty = ", ".join(f"{key}={deltas.get(key, 0)}" for key in CLASSES if deltas.get(key)) or "no requests"
+    print(f"  warm refresh (ETag match, files present): download skipped ({pretty})")
+    if deltas.get("download"):
+        raise SystemExit(f"unchanged archive was downloaded again: {deltas}")
+    if not deltas.get("metadata"):
+        raise SystemExit(f"warm refresh did not read blob properties: {deltas}")
+
+
 def main() -> None:
-    print(f"Cold-staging benchmark, {ROUNDS} rounds each (local dir wiped before every round)\n")
+    print(f"stock classpath:   {WASB_DAG_BUNDLE_CLASSPATH}")
+    print(f"archive classpath: {WASB_ARCHIVE_DAG_BUNDLE_CLASSPATH}")
+    assert_split()
+    print(f"\nCold-staging benchmark, {ROUNDS} rounds each (local dir wiped before every round)\n")
 
     print("[1/2] stock WasbDagBundle — serial per-blob sync")
     stock = scenario(
@@ -83,15 +145,18 @@ def main() -> None:
     )
 
     print("\n[2/2] WasbArchiveDagBundle — single tar.gz blob")
-    archive = scenario(
-        "single archive (WasbArchiveDagBundle)",
-        lambda: WasbArchiveDagBundle(
+
+    def make_archive():
+        return WasbArchiveDagBundle(
             name="bench-archive",
             container_name=CONTAINER,
             archive_blob=ARCHIVE_BLOB,
             wasb_conn_id="wasb_default",
-        ),
-    )
+        )
+
+    archive = scenario("single archive (WasbArchiveDagBundle)", make_archive)
+    assert_archive_marker(make_archive())
+    assert_warm_skips_download(make_archive)
 
     print(f"\n{'=' * 74}")
     print(f"{'scenario':<46}{'median':>9}{'blob reqs':>10}{'files':>8}")

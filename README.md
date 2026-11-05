@@ -18,10 +18,24 @@ and
 ([#67016](https://github.com/apache/airflow/pull/67016)) and is **not** in the
 latest provider release on PyPI (`apache-airflow-providers-microsoft-azure`
 15.2.1). That release also has no `WasbHook.sync_to_local_dir`. This repo
-includes the bundle class from main and the same serial loop (`list_blobs` +
-one `get_file` per blob). `WasbArchiveDagBundle` changes only the staging
-strategy. `archive_blob` is mutually exclusive with `prefix`. There is no
-Airflow pull request for the archive option yet.
+vendors the prefix bundle and the same serial loop (`list_blobs` + one
+`get_file` per blob).
+
+The archive path is a separate class, `WasbArchiveDagBundle`, with
+`archive_blob`. It is not a flag on `WasbDagBundle`. That is the class split
+from the S3 review tip
+([#73015](https://github.com/apache/airflow/pull/73015)
+[`ad0592a`](https://github.com/apache/airflow/commit/ad0592a555cdc1110e006b5c8b989a5e02e634a6));
+the open Azure pull request
+([#75657](https://github.com/apache/airflow/pull/75657)) still puts
+`archive_blob` on `WasbDagBundle` and will follow this split. The provider
+classpath, once that class exists, is
+`airflow.providers.microsoft.azure.bundles.wasb.WasbArchiveDagBundle`.
+15.2.1 does not ship it, so the live config uses `wasb_bundle.WasbArchiveDagBundle`.
+Importing that name re-exports the provider class when it is installed.
+`WasbDagBundle` does not accept `archive_blob`, and `WasbArchiveDagBundle`
+does not accept `prefix` (`TypeError`). The archive is the only source of
+the DAGs.
 
 Everything runs on your machine: `astro dev` (Airflow 3.3, same runtime as
 the other two reproductions) plus
@@ -30,19 +44,27 @@ the other two reproductions) plus
 The account key in [`.env`](.env) is Azurite's published development account.
 
 ```
-per-blob sync (stock)                    single archive (this PoC)
+per-blob sync (WasbDagBundle)            single archive (WasbArchiveDagBundle)
 
 worker start                             worker start
   │                                        │
   ├─ GET  container                        ├─ GET  container
   ├─ LIST prefix                           ├─ HEAD archive etag
   ├─ LIST prefix                     ─┐    ├─ GET  archive.tar.gz     ─┐
-  ├─ GET  file_001                    │    └─ unpack + rename swap    ─┘
-  ├─ GET  file_002                    │slow
-  ├─ ...                              │
+  ├─ GET  file_001                    │    │    If-Not-Modified         │
+  ├─ GET  file_002                    │    └─ unpack + rename swap    ─┘
+  ├─ ...                         slow │    task code runs
   ├─ GET  file_400                   ─┘
   task code runs
 ```
+
+The ETag is stored beside the bundle directory (`./.{bundle name}/etag`), not
+inside it. A warm refresh whose marker matches and whose directory still has
+files does not download. Wiping the directory and leaving the marker (a fresh
+worker) stages again. An empty ETag never skips. The download is pinned with
+`IfNotModified` on the ETag from that properties read. A failed swap puts the
+previous tree back. Leftover `archive-staging-*` directories are removed from
+that same state directory. Archive mode requires Python 3.11.4 or later.
 
 ## Prerequisites
 
@@ -99,8 +121,12 @@ speedup: 8.8x   (every KubernetesExecutor task pod pays the cold-staging cost)
 
 The request mix did not move between rounds. Stock cold staging is 1
 container GET, 2 lists (the prefix check, then the refresh), and 400 blob
-downloads. The archive is 1 container GET, 2 metadata reads (blob exists,
-then the etag), and 1 download.
+downloads. That run's archive path probed blob properties twice (initialize,
+then refresh). This revision's cold archive path is 1 container GET, 1
+properties read, and 1 download pinned with `IfNotModified` (3 blob requests).
+A following warm refresh is the properties read only. The timings above are
+from that earlier loopback run; request count is the part that does not
+depend on the emulator.
 
 Loopback Azurite makes each call a few milliseconds, so the wall-clock ratio
 is a floor. Request count is the part that does not depend on the emulator.
@@ -127,7 +153,7 @@ is expected.
 ## Layout
 
 ```
-bundle_pkg/            WasbDagBundle (from main) and WasbArchiveDagBundle
+bundle_pkg/            vendored WasbDagBundle and WasbArchiveDagBundle
 scripts/generate_bundle.py   synthetic bundle generator (host, stdlib only)
 scripts/seed_wasb.py   upload both layouts straight to Azurite
 scripts/wasb_proxy.py  counts blob requests, then forwards to Azurite
@@ -137,13 +163,31 @@ docker-compose.override.yml  adds Azurite and the counting proxy
 justfile               all of the above, wired end to end
 ```
 
+## Configs
+
+Both bundles use container `dag-bundles` and connection `wasb_default`.
+They differ by class and by which remote object they read:
+
+| | per-blob | archive |
+|---|---|---|
+| name | `wasb-per-object` | `wasb-archive` |
+| classpath now | `wasb_bundle.WasbDagBundle` | `wasb_bundle.WasbArchiveDagBundle` |
+| classpath once the provider ships the class | `airflow.providers.microsoft.azure.bundles.wasb.WasbDagBundle` | `airflow.providers.microsoft.azure.bundles.wasb.WasbArchiveDagBundle` |
+| kwargs that select the source | `prefix=dags/` | `archive_blob=archive/dag-bundle.tar.gz` |
+
+`refresh_interval` is `86400` on both so the DAG processor does not restage
+while `just bench` is counting. The benchmark constructs the same two classes
+directly (`bench-per-object` and `bench-archive`) and prints the classpath it
+resolved.
+
 ## Notes
 
 - Members are extracted relative to the bundle root, so pack the *contents* of
   the DAGs directory (`tar -C dags .`) rather than the directory itself.
-- The PoC extracts with `tarfile`'s `filter="data"` and swaps directories by
-  rename. There is a short gap between the two renames where the directory
+- The archive extracts with `tarfile`'s `filter="data"` and swaps directories
+  by rename. There is a short gap between the two renames where the directory
   does not exist. A failed swap puts the previous tree back.
-- `prefix` and `archive_blob` are mutually exclusive. Delete the archive blob
-  and rerun `just bench` to watch the archive bundle fail instead of staging
-  from the per-blob prefix.
+- Delete the archive blob and rerun `just bench` to watch `WasbArchiveDagBundle`
+  fail. It does not fall back to the per-blob prefix. A `WasbDagBundle` refresh
+  of the same bundle name deletes the sibling ETag marker so a later archive
+  bundle restages.

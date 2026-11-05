@@ -1,7 +1,7 @@
 [project]
 name = "wasb-archive-dag-bundle"
 version = "0.1.0"
-description = "Proof of concept: stage an Airflow DAG bundle from a single Azure blob archive instead of one request per file"
+description = "Vendored WasbDagBundle and WasbArchiveDagBundle for provider releases that do not ship the class split yet"
 requires-python = ">=3.10"
 # The provider is installed separately (see the Dockerfile). Declaring it
 # here would pull the full Azure provider.

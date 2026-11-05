@@ -1,7 +1,9 @@
 FROM astrocrpublic.azurecr.io/runtime:3.3-7
 
-# 15.2.1 is the latest provider on PyPI. It ships WasbHook, not WasbDagBundle.
-# The bundle classes live in bundle_pkg and call that hook. A full provider
+# 15.2.1 is the latest provider on PyPI. It ships WasbHook, not WasbDagBundle
+# or WasbArchiveDagBundle. bundle_pkg vendors both classes and calls that hook.
+# wasb_bundle re-exports the provider classes when
+# airflow.providers.microsoft.azure.bundles.wasb defines them. A full provider
 # install also pulls every Azure product client this reproduction never calls.
 USER root
 RUN pip freeze > /tmp/existing.txt \
