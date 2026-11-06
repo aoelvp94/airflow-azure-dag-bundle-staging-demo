@@ -17,19 +17,20 @@ and
 `WasbDagBundle` is on Airflow main
 ([#67016](https://github.com/apache/airflow/pull/67016)) and is **not** in the
 latest provider release on PyPI (`apache-airflow-providers-microsoft-azure`
-15.2.1). That release also has no `WasbHook.sync_to_local_dir`. This repo
-vendors the prefix bundle and the same serial loop (`list_blobs` + one
-`get_file` per blob).
+15.2.1). That release also has no `WasbHook.sync_to_local_dir` and no
+`WasbHook.check_for_container`. This repo vendors both bundle classes from
+[apache/airflow#75657](https://github.com/apache/airflow/pull/75657) tip
+[`c853ba97`](https://github.com/aoelvp94/airflow/commit/c853ba97b57118de4c18915a4337ea72bc939284)
+(`wasb-dag-bundle-archive-staging`) and, only when those hook methods are
+missing, the same commit's serial prefix loop (`list_blobs` + one `get_file`
+per blob).
 
 The archive path is a separate class, `WasbArchiveDagBundle`, with
-`archive_blob`. It is not a flag on `WasbDagBundle`. That is the class split
-from the S3 review tip
-([#73015](https://github.com/apache/airflow/pull/73015)
-[`ad0592a`](https://github.com/apache/airflow/commit/ad0592a555cdc1110e006b5c8b989a5e02e634a6));
-the open Azure pull request
-([#75657](https://github.com/apache/airflow/pull/75657)) still puts
-`archive_blob` on `WasbDagBundle` and will follow this split. The provider
-classpath, once that class exists, is
+`archive_blob`. It is not a flag on `WasbDagBundle`. That class split is the
+shape of the #75657 tip above (the same split as the S3 review tip
+[#73015](https://github.com/apache/airflow/pull/73015)
+[`ad0592a`](https://github.com/apache/airflow/commit/ad0592a555cdc1110e006b5c8b989a5e02e634a6)).
+The provider classpath, once that class ships, is
 `airflow.providers.microsoft.azure.bundles.wasb.WasbArchiveDagBundle`.
 15.2.1 does not ship it, so the live config uses `wasb_bundle.WasbArchiveDagBundle`.
 Importing that name re-exports the provider class when it is installed.
@@ -58,13 +59,17 @@ worker start                             worker start
   task code runs
 ```
 
-The ETag is stored beside the bundle directory (`./.{bundle name}/etag`), not
-inside it. A warm refresh whose marker matches and whose directory still has
-files does not download. Wiping the directory and leaving the marker (a fresh
-worker) stages again. An empty ETag never skips. The download is pinned with
+The ETag is stored inside the staged tree (`{wasb_dags_dir}/.archive_etag`).
+A warm refresh whose marker matches and whose directory still has files other
+than that marker does not download. Wiping the directory removes the marker,
+so the next initialize stages again. A tree that contains only the marker
+also stages again. An empty ETag never skips. The download is pinned with
 `IfNotModified` on the ETag from that properties read. A failed swap puts the
-previous tree back. Leftover `archive-staging-*` directories are removed from
-that same state directory. Archive mode requires Python 3.11.4 or later.
+previous tree back. Temporary `archive-staging-*` directories live beside the
+tree, under `.{bundle name}/`, and are removed on the next refresh. A
+`WasbDagBundle` refresh does not unlink a sibling `.{bundle name}/etag`. It
+drops `.archive_etag` only because that file is not part of the remote prefix
+(`delete_stale`). Archive mode requires Python 3.11.4 or later.
 
 ## Prerequisites
 
@@ -100,12 +105,13 @@ on localhost):
 Cold-staging benchmark, 3 rounds each (local dir wiped before every round)
 
 [1/2] stock WasbDagBundle — serial per-blob sync
-  round 1:   1.50s   (download=400, list=2, container=1)
-  round 2:   1.39s   (download=400, list=2, container=1)
-  round 3:   1.36s   (download=400, list=2, container=1)
+  round 1:   1.46s   (download=400, list=2, container=1)
+  round 2:   1.43s   (download=400, list=2, container=1)
+  round 3:   1.40s   (download=400, list=2, container=1)
+  prefix refresh left the sibling etag in place and dropped .archive_etag
 
 [2/2] WasbArchiveDagBundle — single tar.gz blob
-  round 1:   0.07s   (download=1, metadata=1, container=1)
+  round 1:   0.06s   (download=1, metadata=1, container=1)
   round 2:   0.06s   (download=1, metadata=1, container=1)
   round 3:   0.06s   (download=1, metadata=1, container=1)
   warm refresh (ETag match, files present): download skipped (metadata=1)
@@ -113,11 +119,11 @@ Cold-staging benchmark, 3 rounds each (local dir wiped before every round)
 ==========================================================================
 scenario                                         median blob reqs   files
 --------------------------------------------------------------------------
-per-object sync (stock WasbDagBundle)             1.39s       403     400
+per-object sync (stock WasbDagBundle)             1.43s       403     400
 single archive (WasbArchiveDagBundle)             0.06s         3     400
 ==========================================================================
 
-speedup: 21.3x   (every KubernetesExecutor task pod pays the cold-staging cost)
+speedup: 23.4x   (every KubernetesExecutor task pod pays the cold-staging cost)
 ```
 
 The request mix did not move between rounds. Stock cold staging is 1
@@ -151,7 +157,7 @@ is expected.
 ## Layout
 
 ```
-bundle_pkg/            vendored WasbDagBundle and WasbArchiveDagBundle
+bundle_pkg/            vendored WasbDagBundle and WasbArchiveDagBundle (tip c853ba97)
 scripts/generate_bundle.py   synthetic bundle generator (host, stdlib only)
 scripts/seed_wasb.py   upload both layouts straight to Azurite
 scripts/wasb_proxy.py  counts blob requests, then forwards to Azurite
@@ -187,5 +193,6 @@ resolved.
   does not exist. A failed swap puts the previous tree back.
 - Delete the archive blob and rerun `just bench` to watch `WasbArchiveDagBundle`
   fail. It does not fall back to the per-blob prefix. A `WasbDagBundle` refresh
-  of the same bundle name deletes the sibling ETag marker so a later archive
-  bundle restages.
+  of the same bundle name drops `{wasb_dags_dir}/.archive_etag` (that file is
+  not in the prefix) and leaves a sibling `.{bundle name}/etag` in place. The
+  next archive refresh then restages, because the in-tree marker is gone.

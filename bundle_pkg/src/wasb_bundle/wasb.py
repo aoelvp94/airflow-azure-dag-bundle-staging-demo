@@ -1,24 +1,26 @@
-"""
-Vendored WASB Dag bundles for provider releases that do not ship them.
-
-``apache-airflow-providers-microsoft-azure`` 15.2.1 has ``WasbHook`` and does
-not have ``WasbDagBundle`` (main, apache/airflow#67016) or
-``WasbArchiveDagBundle``. This module mirrors the class split on the S3
-archive tip (apache/airflow#73015, ``S3ArchiveDagBundle``): the prefix sync
-and the single-blob archive are separate classes, with no ``archive_blob``
-flag and no ``__new__`` dispatch.
-
-The archive class stores its ETag beside the bundle directory, skips the
-download only when that marker matches and the local tree still has files,
-and pins the download with ``IfNotModified``.
-"""
-
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 from __future__ import annotations
 
 import os
 import shutil
 import tarfile
 import tempfile
+from functools import cached_property
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -38,17 +40,8 @@ def _require_tar_data_filter() -> None:
 
 def _extract_archive(archive_path: Path, unpack_dir: Path) -> None:
     """Unpack a bundle archive without writing outside ``unpack_dir``."""
-    _require_tar_data_filter()
     with tarfile.open(archive_path, "r:*") as tar:
         tar.extractall(unpack_dir, filter="data")
-
-
-def _archive_state_dir(bundle_dir: Path, bundle_name: str) -> Path:
-    return bundle_dir.parent / f".{bundle_name}"
-
-
-def _archive_etag_path(bundle_dir: Path, bundle_name: str) -> Path:
-    return _archive_state_dir(bundle_dir, bundle_name) / "etag"
 
 
 class _WasbDagBundleBase(BaseDagBundle):
@@ -69,21 +62,22 @@ class _WasbDagBundleBase(BaseDagBundle):
         self.wasb_conn_id = wasb_conn_id
         self.container_name = container_name
         self.wasb_dags_dir: Path = self.base_dir
+        self._log = self._get_logger()
 
-        log = structlog.get_logger(__name__)
-        self._log = log.bind(
-            bundle_name=self.name,
-            version=self.version,
-            container_name=self.container_name,
-            wasb_conn_id=self.wasb_conn_id,
-            **self._log_fields(),
-        )
-        self._wasb_hook: WasbHook | None = None
+    def _log_bindings(self) -> dict[str, str | None]:
+        """Return log context shared by every WASB Dag bundle."""
+        return {
+            "bundle_name": self.name,
+            "version": self.version,
+            "container_name": self.container_name,
+            "wasb_conn_id": self.wasb_conn_id,
+        }
 
-    def _log_fields(self) -> dict[str, str]:
-        return {}
+    def _get_logger(self):
+        """Return a logger bound with the context common to every WASB Dag bundle."""
+        return structlog.get_logger(__name__).bind(**self._log_bindings())
 
-    def _view_url_suffix(self) -> str:
+    def _view_url_key(self) -> str:
         return ""
 
     def _validate_remote(self) -> None:
@@ -98,11 +92,7 @@ class _WasbDagBundleBase(BaseDagBundle):
             if not self.wasb_dags_dir.is_dir():
                 raise NotADirectoryError(f"Local Dags path: {self.wasb_dags_dir} is not a directory.")
 
-            try:
-                exists = self._container_client().exists()
-            except ResourceNotFoundError:
-                exists = False
-            if not exists:
+            if not self.wasb_hook.check_for_container(container_name=self.container_name):
                 raise ValueError(f"WASB container '{self.container_name}' does not exist.")
 
             self._validate_remote()
@@ -112,14 +102,9 @@ class _WasbDagBundleBase(BaseDagBundle):
         self._initialize()
         super().initialize()
 
-    @property
+    @cached_property
     def wasb_hook(self) -> WasbHook:
-        if self._wasb_hook is None:
-            self._wasb_hook = WasbHook(wasb_conn_id=self.wasb_conn_id)
-        return self._wasb_hook
-
-    def _container_client(self):
-        return self.wasb_hook.get_conn().get_container_client(self.container_name)
+        return WasbHook(wasb_conn_id=self.wasb_conn_id)
 
     def get_current_version(self) -> str | None:
         """Return the current version of the Dag bundle. Currently not supported."""
@@ -148,27 +133,36 @@ class _WasbDagBundleBase(BaseDagBundle):
         account_url = self.wasb_hook.blob_service_client.url
         scheme, netloc, path, _, _ = urlsplit(account_url)
         path = f"{path.rstrip('/')}/{self.container_name}"
-        suffix = self._view_url_suffix()
-        if suffix:
-            path = f"{path}/{suffix}"
+        key = self._view_url_key()
+        if key:
+            path = f"{path}/{key}"
         return urlunsplit((scheme, netloc, path, "", ""))
 
     def _reject_version_refresh(self) -> None:
         if self.version:
             raise ValueError("Refreshing a specific version is not supported")
 
+    def refresh(self) -> None:
+        """Refresh the Dag bundle by updating the local Dag files from Azure Blob Storage."""
+        self._reject_version_refresh()
+        with self.lock():
+            self._refresh_locked()
+
+    def _refresh_locked(self) -> None:
+        """Stage the bundle while the bundle lock is held."""
+        raise NotImplementedError
+
 
 class WasbDagBundle(_WasbDagBundleBase):
     """
     WASB Dag bundle - exposes a directory in Azure Blob Storage as a Dag bundle.
 
-    The released provider has no ``WasbHook.sync_to_local_dir`` yet, so refresh
-    lists the prefix and downloads each blob on the calling thread (``list_blobs``
-    + ``get_file``), which is that hook's loop on main.
+    This allows Airflow to load Dags directly from an Azure Blob Storage container.
 
-    :param wasb_conn_id: Airflow connection ID for Azure Blob Storage.
-    :param container_name: The blob container that holds the Dag files.
-    :param prefix: Optional subdirectory within the container.
+    :param wasb_conn_id: Airflow connection ID for Azure Blob Storage. Defaults to WasbHook.default_conn_name.
+    :param container_name: The name of the blob container containing the Dag files.
+    :param prefix: Optional subdirectory within the container where the Dags are stored.
+        If empty, Dags are assumed to be at the root of the container.
     """
 
     supports_versioning = False
@@ -184,17 +178,17 @@ class WasbDagBundle(_WasbDagBundleBase):
         self.prefix = prefix
         super().__init__(wasb_conn_id=wasb_conn_id, container_name=container_name, **kwargs)
 
-    def _log_fields(self) -> dict[str, str]:
-        return {"prefix": self.prefix}
+    def _get_logger(self):
+        """Return a logger bound with this prefix bundle's context."""
+        return structlog.get_logger(__name__).bind(**self._log_bindings(), prefix=self.prefix)
 
-    def _view_url_suffix(self) -> str:
+    def _view_url_key(self) -> str:
         return self.prefix
 
     def _validate_remote(self) -> None:
         if self.prefix:
-            prefix = f"{self.prefix.rstrip('/')}/"
             if not self.wasb_hook.check_for_prefix(
-                container_name=self.container_name, prefix=prefix, delimiter="/"
+                container_name=self.container_name, prefix=f"{self.prefix.rstrip('/')}/", delimiter="/"
             ):
                 raise ValueError(f"WASB prefix 'wasb://{self.container_name}/{self.prefix}' does not exist.")
 
@@ -208,67 +202,31 @@ class WasbDagBundle(_WasbDagBundleBase):
             f")>"
         )
 
-    def refresh(self) -> None:
-        """Refresh the Dag bundle by re-downloading the Dags from Azure Blob Storage."""
-        self._reject_version_refresh()
-
-        with self.lock():
-            # The same bundle name may previously have been a WasbArchiveDagBundle.
-            # Drop its ETag so switching back to the archive restages instead of
-            # keeping these files.
-            _archive_etag_path(self.wasb_dags_dir, self.name).unlink(missing_ok=True)
-            self._log.debug(
-                "Downloading Dags from wasb://%s/%s to %s",
-                self.container_name,
-                self.prefix,
-                self.wasb_dags_dir,
-            )
-            self._sync_to_local_dir()
-
-    def _sync_to_local_dir(self) -> None:
-        """Serial per-blob staging, matching ``WasbHook.sync_to_local_dir`` on main."""
-        local_dir = self.wasb_dags_dir
-        local_dir_resolved = local_dir.resolve()
-        prefix = self.prefix
-        list_prefix = f"{prefix.rstrip('/')}/" if prefix else prefix
-        container = self._container_client()
-
-        local_wasb_objects: list[Path] = []
-        for blob in container.list_blobs(name_starts_with=list_prefix):
-            if blob.name.endswith("/"):
-                continue
-            blob_path = Path(blob.name)
-            if prefix:
-                local_target_path = local_dir.joinpath(blob_path.relative_to(prefix))
-            else:
-                local_target_path = local_dir.joinpath(blob_path)
-            if not local_target_path.resolve().is_relative_to(local_dir_resolved):
-                raise ValueError(f"Blob name {blob.name!r} resolves outside local directory {local_dir}")
-            if not local_target_path.parent.exists():
-                local_target_path.parent.mkdir(parents=True, exist_ok=True)
-            self.wasb_hook.get_file(
-                file_path=str(local_target_path),
-                container_name=self.container_name,
-                blob_name=blob.name,
-            )
-            local_wasb_objects.append(local_target_path)
-
-        current = {path.resolve() for path in local_wasb_objects}
-        for item in local_dir.rglob("*"):
-            if item.is_file() and item.resolve() not in current:
-                item.unlink()
+    def _refresh_locked(self) -> None:
+        self._log.debug(
+            "Downloading Dags from wasb://%s/%s to %s",
+            self.container_name,
+            self.prefix,
+            self.wasb_dags_dir,
+        )
+        self.wasb_hook.sync_to_local_dir(
+            container_name=self.container_name,
+            prefix=self.prefix,
+            local_dir=self.wasb_dags_dir,
+            delete_stale=True,
+        )
 
 
 class WasbArchiveDagBundle(_WasbDagBundleBase):
     """
     WASB Dag bundle staged from a single ``.tar.gz`` blob.
 
-    The archive is the only source of the Dags. Members are extracted relative
-    to the bundle root, for example ``tar -C <dags_dir> -czf dags.tar.gz .``.
-    Requires Python 3.11.4 or later.
+    The archive is the only source of the Dags. Members are extracted relative to the
+    bundle root, for example ``tar -C <dags_dir> -czf dags.tar.gz .``. Requires Python
+    3.11.4 or later.
 
-    :param wasb_conn_id: Airflow connection ID for Azure Blob Storage.
-    :param container_name: The blob container that holds the archive.
+    :param wasb_conn_id: Airflow connection ID for Azure Blob Storage. Defaults to WasbHook.default_conn_name.
+    :param container_name: The name of the blob container containing the archive.
     :param archive_blob: Blob name of the ``.tar.gz`` archive holding the Dag files.
     """
 
@@ -286,10 +244,11 @@ class WasbArchiveDagBundle(_WasbDagBundleBase):
         self.archive_blob = archive_blob
         super().__init__(wasb_conn_id=wasb_conn_id, container_name=container_name, **kwargs)
 
-    def _log_fields(self) -> dict[str, str]:
-        return {"archive_blob": self.archive_blob}
+    def _get_logger(self):
+        """Return a logger bound with this archive bundle's context."""
+        return structlog.get_logger(__name__).bind(**self._log_bindings(), archive_blob=self.archive_blob)
 
-    def _view_url_suffix(self) -> str:
+    def _view_url_key(self) -> str:
         return self.archive_blob
 
     def __repr__(self):
@@ -303,13 +262,18 @@ class WasbArchiveDagBundle(_WasbDagBundleBase):
         )
 
     def _archive_state_dir(self) -> Path:
-        return _archive_state_dir(self.wasb_dags_dir, self.name)
+        return self.wasb_dags_dir.parent / f".{self.name}"
 
     def _archive_etag_path(self) -> Path:
-        return _archive_etag_path(self.wasb_dags_dir, self.name)
+        """Return the ETag marker path inside the staged Dag tree."""
+        return self.wasb_dags_dir / ".archive_etag"
 
     def _bundle_dir_has_files(self) -> bool:
-        return self.wasb_dags_dir.is_dir() and any(path.is_file() for path in self.wasb_dags_dir.rglob("*"))
+        """Return whether the staged tree has files other than the ETag marker."""
+        marker = self._archive_etag_path()
+        return self.wasb_dags_dir.is_dir() and any(
+            path.is_file() and path != marker for path in self.wasb_dags_dir.rglob("*")
+        )
 
     def _remove_stale_archive_staging_dirs(self) -> None:
         state_dir = self._archive_state_dir()
@@ -319,73 +283,63 @@ class WasbArchiveDagBundle(_WasbDagBundleBase):
             if leftover.is_dir() and leftover.name.startswith("archive-staging-"):
                 shutil.rmtree(leftover, ignore_errors=True)
 
-    def _download_archive(self, blob, archive_path: Path, etag: str) -> None:
-        """Download the archive blob pinned to ``etag`` when one was read."""
-        kwargs: dict = {}
-        if etag:
-            kwargs["etag"] = etag
-            kwargs["match_condition"] = MatchConditions.IfNotModified
-        downloader = blob.download_blob(**kwargs)
-        with archive_path.open("wb") as handle:
-            for chunk in downloader.chunks():
-                handle.write(chunk)
+    def _refresh_locked(self) -> None:
+        self._remove_stale_archive_staging_dirs()
+        blob = self.wasb_hook.get_conn().get_blob_client(self.container_name, self.archive_blob)
+        try:
+            props = blob.get_blob_properties()
+        except ResourceNotFoundError:
+            raise ValueError(
+                f"WASB archive 'wasb://{self.container_name}/{self.archive_blob}' does not exist."
+            )
+        etag = props.etag or ""
 
-    def refresh(self) -> None:
-        """Refresh the Dag bundle by downloading and unpacking the archive blob."""
-        self._reject_version_refresh()
+        marker = self._archive_etag_path()
+        if etag and marker.is_file() and marker.read_text() == etag and self._bundle_dir_has_files():
+            self._log.debug(
+                "Dag bundle archive 'wasb://%s/%s' is unchanged (ETag %s), skipping staging",
+                self.container_name,
+                self.archive_blob,
+                etag,
+            )
+            return
 
-        with self.lock():
-            self._remove_stale_archive_staging_dirs()
-            blob = self.wasb_hook.get_conn().get_blob_client(self.container_name, self.archive_blob)
+        state_dir = self._archive_state_dir()
+        state_dir.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(dir=state_dir, prefix="archive-staging-"))
+        try:
+            archive_path = staging_dir / "_bundle_archive"
+            download_kwargs = {}
+            if etag:
+                download_kwargs["etag"] = etag
+                download_kwargs["match_condition"] = MatchConditions.IfNotModified
+            payload = blob.download_blob(**download_kwargs).readall()
+            archive_path.write_bytes(payload)
+
+            unpack_dir = staging_dir / "unpacked"
+            unpack_dir.mkdir()
+            _extract_archive(archive_path, unpack_dir)
+            archive_path.unlink()
+
+            backup_dir = staging_dir / "previous"
+            if self.wasb_dags_dir.exists():
+                self.wasb_dags_dir.rename(backup_dir)
             try:
-                props = blob.get_blob_properties()
-            except ResourceNotFoundError:
-                raise ValueError(
-                    f"WASB archive 'wasb://{self.container_name}/{self.archive_blob}' does not exist."
-                ) from None
-            etag = props.etag or ""
+                unpack_dir.rename(self.wasb_dags_dir)
+            except Exception:
+                if backup_dir.exists():
+                    backup_dir.rename(self.wasb_dags_dir)
+                raise
 
-            marker = self._archive_etag_path()
-            if etag and marker.is_file() and marker.read_text() == etag and self._bundle_dir_has_files():
-                self._log.debug(
-                    "Dag bundle archive 'wasb://%s/%s' is unchanged (ETag %s), skipping staging",
-                    self.container_name,
-                    self.archive_blob,
-                    etag,
-                )
-                return
+            if etag:
+                self._archive_etag_path().write_text(etag)
 
-            state_dir = self._archive_state_dir()
-            state_dir.mkdir(parents=True, exist_ok=True)
-            staging_dir = Path(tempfile.mkdtemp(dir=state_dir, prefix="archive-staging-"))
-            try:
-                archive_path = staging_dir / "_bundle_archive"
-                self._download_archive(blob, archive_path, etag)
-
-                unpack_dir = staging_dir / "unpacked"
-                unpack_dir.mkdir()
-                _extract_archive(archive_path, unpack_dir)
-                archive_path.unlink()
-
-                backup_dir = staging_dir / "previous"
-                if self.wasb_dags_dir.exists():
-                    self.wasb_dags_dir.rename(backup_dir)
-                try:
-                    unpack_dir.rename(self.wasb_dags_dir)
-                except Exception:
-                    if backup_dir.exists():
-                        backup_dir.rename(self.wasb_dags_dir)
-                    raise
-
-                if etag:
-                    self._archive_etag_path().write_text(etag)
-
-                self._log.info(
-                    "Staged Dag bundle from archive 'wasb://%s/%s' (%s bytes) to %s",
-                    self.container_name,
-                    self.archive_blob,
-                    props.size,
-                    self.wasb_dags_dir,
-                )
-            finally:
-                shutil.rmtree(staging_dir, ignore_errors=True)
+            self._log.debug(
+                "Staged Dag bundle from archive 'wasb://%s/%s' (%s bytes) to %s",
+                self.container_name,
+                self.archive_blob,
+                len(payload),
+                self.wasb_dags_dir,
+            )
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)

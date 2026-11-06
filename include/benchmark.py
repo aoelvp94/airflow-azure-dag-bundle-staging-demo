@@ -4,8 +4,10 @@ Benchmark cold DAG-bundle staging: stock per-blob sync vs single archive.
 
 Runs INSIDE an Airflow container (see `just bench`). Each round wipes the
 bundle's local directory first, simulating a fresh worker pod. The archive
-ETag marker lives beside that directory, so the wipe leaves the marker in
-place. An empty directory is staged again instead of counting as unchanged.
+ETag marker lives inside that directory (``.archive_etag``), so the wipe
+removes it and the next initialize stages again. A prefix refresh drops an
+in-tree marker because it is not a remote blob. It does not unlink a sibling
+``.{name}/etag``.
 """
 
 from __future__ import annotations
@@ -107,11 +109,31 @@ def assert_split() -> None:
 
 
 def assert_archive_marker(bundle) -> None:
-    marker = bundle.path.parent / f".{bundle.name}" / "etag"
+    marker = bundle.path / ".archive_etag"
     if not marker.is_file() or not marker.read_text():
-        raise SystemExit(f"expected ETag marker beside the bundle directory at {marker}")
-    if (bundle.path / ".staged-archive-etag").exists():
-        raise SystemExit("ETag marker must not live inside the bundle directory")
+        raise SystemExit(f"expected ETag marker inside the staged tree at {marker}")
+    sibling = bundle.path.parent / f".{bundle.name}" / "etag"
+    if sibling.exists():
+        raise SystemExit(f"archive staging must not write a sibling ETag marker at {sibling}")
+
+
+def assert_prefix_leaves_sibling_marker(make_bundle) -> None:
+    """Prefix refresh drops the in-tree marker and leaves a sibling etag file."""
+    bundle = make_bundle()
+    sibling = bundle.path.parent / f".{bundle.name}" / "etag"
+    sibling.parent.mkdir(parents=True, exist_ok=True)
+    sibling.write_text("leftover")
+    in_tree = bundle.path / ".archive_etag"
+    in_tree.write_text("drop-me")
+    bundle.refresh()
+    if not sibling.is_file() or sibling.read_text() != "leftover":
+        raise SystemExit(f"prefix refresh unlinked the sibling ETag marker at {sibling}")
+    if in_tree.exists():
+        raise SystemExit(f"prefix refresh left the in-tree marker at {in_tree}")
+    sibling.unlink(missing_ok=True)
+    if sibling.parent.is_dir() and not any(sibling.parent.iterdir()):
+        sibling.parent.rmdir()
+    print("  prefix refresh left the sibling etag in place and dropped .archive_etag")
 
 
 def assert_warm_skips_download(make_bundle) -> None:
@@ -134,15 +156,17 @@ def main() -> None:
     print(f"\nCold-staging benchmark, {ROUNDS} rounds each (local dir wiped before every round)\n")
 
     print("[1/2] stock WasbDagBundle — serial per-blob sync")
-    stock = scenario(
-        "per-object sync (stock WasbDagBundle)",
-        lambda: WasbDagBundle(
+
+    def make_stock():
+        return WasbDagBundle(
             name="bench-per-object",
             container_name=CONTAINER,
             prefix=PREFIX,
             wasb_conn_id="wasb_default",
-        ),
-    )
+        )
+
+    stock = scenario("per-object sync (stock WasbDagBundle)", make_stock)
+    assert_prefix_leaves_sibling_marker(make_stock)
 
     print("\n[2/2] WasbArchiveDagBundle — single tar.gz blob")
 
